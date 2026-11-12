@@ -89,6 +89,12 @@ const PARAMETER_UNSUPPORTED_ERROR: ErrorCode =
     (zstd_sys::ZSTD_ErrorCode::ZSTD_error_parameter_unsupported as usize)
         .wrapping_neg();
 
+/// A parameter outside the supported range (`-ZSTD_error_parameter_outOfBound`).
+#[cfg(feature = "experimental")]
+const PARAMETER_OUT_OF_BOUND_ERROR: ErrorCode =
+    (zstd_sys::ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound as usize)
+        .wrapping_neg();
+
 /// The error code zstd itself returns for an operation the context is in no
 /// state to perform (`-ZSTD_error_stage_wrong` as a `size_t`), for the places
 /// where that has to be decided on the Rust side of a call.
@@ -284,6 +290,65 @@ pub fn get_decompressed_size(src: &[u8]) -> Option<NonZeroU64> {
 pub fn compress_bound(src_size: usize) -> usize {
     // Safety: Just FFI
     unsafe { zstd_sys::ZSTD_compressBound(src_size) }
+}
+
+/// Estimates the native memory budget for single-threaded streaming compression.
+///
+/// Wraps `ZSTD_estimateCStreamSize()`. The native documented budget covers default
+/// compression parameters at positive levels up to `max_compression_level`, with
+/// an arbitrarily large source. Unlike a CCtx-only estimate, it includes streaming
+/// buffers. The level must be in `1..=max_c_level()`; zero and negative levels are
+/// not supported by this wrapper.
+///
+/// This is not a budget for arbitrary parameter overrides, dictionaries, worker
+/// threads or external sequence producers. It is not an allocation limiter and
+/// excludes Rust buffers, allocator overhead and process RSS. Reserve those costs
+/// separately before creating a context; [`CCtx::sizeof()`] reports current
+/// native usage, not the maximum future allocation.
+#[cfg(feature = "experimental")]
+#[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+pub fn estimate_cstream_size(
+    max_compression_level: CompressionLevel,
+) -> SafeResult {
+    // Bound the native loop over levels, including the i32::MAX boundary.
+    if !(1..=max_c_level()).contains(&max_compression_level) {
+        return Err(PARAMETER_OUT_OF_BOUND_ERROR);
+    }
+    // Safety: this function takes only a validated integer and owns no resources.
+    parse_code(unsafe {
+        zstd_sys::ZSTD_estimateCStreamSize(max_compression_level)
+    })
+}
+
+/// Estimates the native memory budget for streaming decompression.
+///
+/// Wraps `ZSTD_estimateDStreamSize()`. `max_window_size` is in **bytes**, not a
+/// logarithm, and must be between `1 << WINDOWLOG_MIN` and the native platform's
+/// maximum window size. It need not be a power of two. Reject larger frame
+/// windows before context creation using [`get_frame_header()`], and also set
+/// [`DParameter::WindowLogMax`] before streaming. The native complete-frame
+/// shortcut can bypass its streaming window check, so that parameter alone is
+/// not a strict header-validation policy.
+///
+/// The native documented budget includes the context and streaming buffers, but
+/// not dictionaries or legacy decoding. It is not an allocation limiter and
+/// excludes Rust buffers, allocator overhead and process RSS. Reserve those
+/// separately before context creation. [`DCtx::sizeof()`] reports current usage.
+#[cfg(feature = "experimental")]
+#[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+pub fn estimate_dstream_size(max_window_size: usize) -> SafeResult {
+    let max_log = if usize::BITS == 32 {
+        WINDOWLOG_MAX_32
+    } else {
+        WINDOWLOG_MAX_64
+    };
+    if !((1usize << WINDOWLOG_MIN)..=(1usize << max_log))
+        .contains(&max_window_size)
+    {
+        return Err(PARAMETER_OUT_OF_BOUND_ERROR);
+    }
+    // Safety: validation bounds native size arithmetic as well as the window.
+    parse_code(unsafe { zstd_sys::ZSTD_estimateDStreamSize(max_window_size) })
 }
 
 /// Remembers an error that may have left a context in a state zstd considers
@@ -2909,6 +2974,104 @@ impl<'a, 'b> Drop for InBufferWrapper<'a, 'b> {
 ///
 /// Same as `DCtx`.
 pub type DStream<'a> = DCtx<'a>;
+
+/// The kind of frame identified by [`get_frame_header()`].
+#[cfg(feature = "experimental")]
+#[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameType {
+    /// An ordinary Zstandard frame.
+    Zstandard,
+    /// A skippable frame, with its magic-number variant (0 through 15).
+    Skippable { id: u32 },
+}
+
+/// Metadata from a complete frame header, not validation of the frame payload.
+///
+/// All sizes are untrusted metadata. Validate them against application limits
+/// before allocating, and still verify actual output, frame completion and the
+/// absence of trailing input when decoding.
+#[cfg(feature = "experimental")]
+#[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameHeader {
+    /// Whether this is an ordinary or skippable frame.
+    pub frame_type: FrameType,
+    /// Declared decoded size, or `None` if unknown. For skippable frames this is
+    /// the skipped payload length instead (not decoded output).
+    pub content_size: Option<u64>,
+    /// Declared history window in bytes; zero for skippable frames.
+    pub window_size: u64,
+    /// Dictionary identifier, if advertised by an ordinary frame. `None` does
+    /// not prove the frame was encoded without a dictionary.
+    pub dict_id: Option<NonZeroU32>,
+    /// Whether an ordinary frame advertises a content checksum.
+    pub checksum: bool,
+    /// Number of bytes in this complete header (not the whole frame).
+    pub header_size: usize,
+}
+
+/// A complete header or the total prefix size needed to continue parsing it.
+#[cfg(feature = "experimental")]
+#[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameHeaderStatus {
+    /// The header was parsed successfully; the payload may still be incomplete.
+    Complete(FrameHeader),
+    /// More input is needed. `required_size` is the total prefix length, not an
+    /// additional byte count. Another call may request a larger prefix again.
+    Incomplete { required_size: usize },
+}
+
+/// Parses a standard-format Zstandard or skippable header without allocating.
+///
+/// Wraps `ZSTD_getFrameHeader()`, leaving input untouched. Invalid headers return
+/// the existing native [`ErrorCode`]; incomplete prefixes return
+/// [`FrameHeaderStatus::Incomplete`]. Buffer at most [`FRAMEHEADERSIZE_MAX`]
+/// bytes when incrementally reading a header. No magicless format is accepted.
+/// A complete header does not validate blocks, checksum contents or trailing
+/// input. The caller chooses its window/content/dictionary/checksum policy.
+#[cfg(feature = "experimental")]
+#[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+pub fn get_frame_header(src: &[u8]) -> Result<FrameHeaderStatus, ErrorCode> {
+    let mut header =
+        core::mem::MaybeUninit::<zstd_sys::ZSTD_FrameHeader>::uninit();
+    // Safety: src is readable for src.len(); header is writable. The native
+    // contract initializes every header field only when it returns zero.
+    let required_size = parse_code(unsafe {
+        zstd_sys::ZSTD_getFrameHeader(
+            header.as_mut_ptr(),
+            ptr_void(src),
+            src.len(),
+        )
+    })?;
+    if required_size != 0 {
+        return Ok(FrameHeaderStatus::Incomplete { required_size });
+    }
+    // Safety: a successful zero result guarantees a fully initialized header.
+    let header = unsafe { header.assume_init() };
+    let (frame_type, dict_id) = match header.frameType {
+        zstd_sys::ZSTD_FrameType_e::ZSTD_frame => {
+            (FrameType::Zstandard, NonZeroU32::new(header.dictID))
+        }
+        zstd_sys::ZSTD_FrameType_e::ZSTD_skippableFrame => {
+            // Native zstd stores the skippable variant in dictID, not a
+            // dictionary identifier. Keep those meanings separate publicly.
+            (FrameType::Skippable { id: header.dictID }, None)
+        }
+    };
+    Ok(FrameHeaderStatus::Complete(FrameHeader {
+        frame_type,
+        content_size: match header.frameContentSize {
+            CONTENTSIZE_UNKNOWN => None,
+            size => Some(size),
+        },
+        window_size: header.windowSize,
+        dict_id,
+        checksum: header.checksumFlag != 0,
+        header_size: header.headerSize as usize,
+    }))
+}
 
 // Some functions work on a "frame prefix".
 // TODO: Define `struct FramePrefix(&[u8]);` and move these functions to it?
