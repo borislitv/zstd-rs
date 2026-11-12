@@ -158,6 +158,7 @@ fn test_cctx_cycle() {
     assert_eq!(INPUT, decompressed);
 }
 
+#[cfg(feature = "zdict_builder")]
 #[test]
 fn test_dictionary() {
     // Prepare some content to train the dictionary.
@@ -211,6 +212,7 @@ fn test_dictionary() {
     assert_eq!(bytes, decompressed);
 }
 
+#[cfg(feature = "zdict_builder")]
 #[test]
 #[should_panic(expected = "sample sizes don't add up")]
 fn test_train_from_buffer_overflowing_sizes() {
